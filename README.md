@@ -2,9 +2,12 @@
 <!-- CI/CD test: verify pull request automation -->
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 <!-- CI/CD end-to-end verification: 2026-11-01 -->
 =======
 >>>>>>> origin/main
 =======
 <!-- CI/CD end-to-end verification: 2026-11-01 -->
 >>>>>>> origin/main
+=======
+>>>>>>> e5692da (test: verify pull request automation)
