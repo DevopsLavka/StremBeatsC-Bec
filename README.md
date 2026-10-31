@@ -3,6 +3,7 @@
 <<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
+<<<<<<< HEAD
 <!-- CI/CD end-to-end verification: 2026-11-01 -->
 =======
 >>>>>>> origin/main
@@ -11,3 +12,6 @@
 >>>>>>> origin/main
 =======
 >>>>>>> e5692da (test: verify pull request automation)
+=======
+<!-- CI/CD end-to-end verification: 2026-11-01 -->
+>>>>>>> 79f42a9 (test: verify end-to-end CI/CD automation)
