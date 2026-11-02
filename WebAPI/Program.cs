@@ -12,6 +12,7 @@ public class Program
 {
     public static void Main(string[] args)
     {
+        // Test automatic PR and merge queue workflow
         var builder = WebApplication.CreateBuilder(args);
         var configuredSecret = builder.Configuration["Jwt:Secret"];
 
