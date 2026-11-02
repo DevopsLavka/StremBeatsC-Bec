@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.CI_CD_BOT_TOKEN }}
       PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
       EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
 
