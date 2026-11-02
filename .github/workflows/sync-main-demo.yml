@@ -1,0 +1,49 @@
+
+name: Sync main-demo after merge
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-main-demo
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync main-demo with main
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main-demo
+        uses: actions/checkout@v4
+        with:
+          ref: main-demo
+          token: ${{ secrets.PULL_REQUEST_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge main into main-demo
+        run: |
+          set -e
+          git fetch origin main main-demo
+          git switch main-demo
+          git merge origin/main --no-edit
+
+      - name: Push synchronized branch
+        run: git push origin main-demo
