@@ -12,6 +12,7 @@ public class Program
 {
     public static void Main(string[] args)
     {
+        // test ci cd 
         var builder = WebApplication.CreateBuilder(args);
         var configuredSecret = builder.Configuration["Jwt:Secret"];
 
