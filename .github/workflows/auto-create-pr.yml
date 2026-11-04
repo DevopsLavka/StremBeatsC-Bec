@@ -19,21 +19,43 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Verify latest commit
+      - name: Verify latest commit and compare branches
         id: verify
         env:
           GH_TOKEN: ${{ secrets.PULL_REQUEST_TOKEN }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        shell: bash
         run: |
-          CURRENT_SHA=$(gh api \
+          set -euo pipefail
+
+          MAIN_SHA=$(gh api \
+            "repos/$GITHUB_REPOSITORY/branches/main" \
+            --jq '.commit.sha')
+
+          MAIN_DEMO_SHA=$(gh api \
             "repos/$GITHUB_REPOSITORY/branches/main-demo" \
             --jq '.commit.sha')
 
-          if [ "$CURRENT_SHA" != "$HEAD_SHA" ]; then
+          if [ "$MAIN_DEMO_SHA" != "$HEAD_SHA" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "A newer commit exists. Skipping stale workflow run."
+            exit 0
+          fi
+
+          MAIN_TREE=$(gh api \
+            "repos/$GITHUB_REPOSITORY/branches/main" \
+            --jq '.commit.commit.tree.sha')
+
+          MAIN_DEMO_TREE=$(gh api \
+            "repos/$GITHUB_REPOSITORY/branches/main-demo" \
+            --jq '.commit.commit.tree.sha')
+
+          if [ "$MAIN_TREE" = "$MAIN_DEMO_TREE" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "main and main-demo contain identical files. No PR needed."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Branches contain different files. PR can be created."
           fi
 
       - name: Create pull request if needed
@@ -41,6 +63,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PULL_REQUEST_TOKEN }}
         run: |
+          set -euo pipefail
+
           PR_NUMBER=$(gh pr list \
             --repo "$GITHUB_REPOSITORY" \
             --base main \
