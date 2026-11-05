@@ -1,4 +1,3 @@
-
 name: Sync main-demo after merge
 
 on:
@@ -19,10 +18,11 @@ concurrency:
 
 jobs:
   sync:
-    name: Sync main-demo with main
+    name: Align main-demo with main
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.merged == true
+
     runs-on: ubuntu-latest
 
     steps:
@@ -38,12 +38,69 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Merge main into main-demo
+      - name: Fetch and verify branches
+        id: verify
+        shell: bash
         run: |
-          set -e
-          git fetch origin main main-demo
-          git switch main-demo
-          git merge origin/main --no-edit
+          set -euo pipefail
 
-      - name: Push synchronized branch
-        run: git push origin main-demo
+          git fetch origin main main-demo
+
+          MAIN_SHA=$(git rev-parse origin/main)
+          DEMO_SHA=$(git rev-parse origin/main-demo)
+
+          MAIN_TREE=$(git rev-parse "${MAIN_SHA}^{tree}")
+          DEMO_TREE=$(git rev-parse "${DEMO_SHA}^{tree}")
+
+          echo "main SHA:      $MAIN_SHA"
+          echo "main-demo SHA: $DEMO_SHA"
+          echo "main tree:     $MAIN_TREE"
+          echo "demo tree:     $DEMO_TREE"
+
+          if [[ "$MAIN_SHA" == "$DEMO_SHA" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Branches already point to the same commit."
+            exit 0
+          fi
+
+          if [[ "$MAIN_TREE" != "$DEMO_TREE" ]]; then
+            echo "::error::Branch contents differ. Refusing to overwrite main-demo."
+            echo "::error::No backup or branch update was performed."
+            exit 1
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "main_sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"
+          echo "demo_sha=$DEMO_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Backup current main-demo
+        if: steps.verify.outputs.skip == 'false'
+        shell: bash
+        env:
+          DEMO_SHA: ${{ steps.verify.outputs.demo_sha }}
+        run: |
+          set -euo pipefail
+
+          BACKUP_BRANCH="backup/main-demo-before-sync-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          git push origin \
+            "${DEMO_SHA}:refs/heads/${BACKUP_BRANCH}"
+
+          echo "Created backup branch: $BACKUP_BRANCH"
+
+      - name: Align main-demo with main
+        if: steps.verify.outputs.skip == 'false'
+        shell: bash
+        env:
+          MAIN_SHA: ${{ steps.verify.outputs.main_sha }}
+          DEMO_SHA: ${{ steps.verify.outputs.demo_sha }}
+        run: |
+          set -euo pipefail
+
+          git push \
+            --force-with-lease="refs/heads/main-demo:${DEMO_SHA}" \
+            origin \
+            "${MAIN_SHA}:refs/heads/main-demo"
+
+          echo "main-demo now points to $MAIN_SHA"
+
