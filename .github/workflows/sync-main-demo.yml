@@ -2,11 +2,8 @@ name: Sync main-demo after merge
 
 on:
   pull_request:
-    types:
-      - closed
-    branches:
-      - main
-
+    types: [closed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -22,7 +19,6 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.merged == true
-
     runs-on: ubuntu-latest
 
     steps:
@@ -48,7 +44,6 @@ jobs:
 
           MAIN_SHA=$(git rev-parse origin/main)
           DEMO_SHA=$(git rev-parse origin/main-demo)
-
           MAIN_TREE=$(git rev-parse "${MAIN_SHA}^{tree}")
           DEMO_TREE=$(git rev-parse "${DEMO_SHA}^{tree}")
 
@@ -59,12 +54,13 @@ jobs:
 
           if [[ "$MAIN_SHA" == "$DEMO_SHA" ]]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Branches already point to the same commit."
+            echo "✅ Branches already point to the same commit. Nothing to do."
             exit 0
           fi
 
           if [[ "$MAIN_TREE" != "$DEMO_TREE" ]]; then
-            echo "::error::Branch contents differ. Refusing to overwrite main-demo."
+            echo "::error::❌ Branch contents differ. Refusing to overwrite main-demo."
+            echo "::error::main and main-demo have diverged. Manual intervention required."
             echo "::error::No backup or branch update was performed."
             exit 1
           fi
@@ -72,6 +68,7 @@ jobs:
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "main_sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"
           echo "demo_sha=$DEMO_SHA" >> "$GITHUB_OUTPUT"
+          echo "ℹ️ Branches have the same content but different SHAs. Will align main-demo → main."
 
       - name: Backup current main-demo
         if: steps.verify.outputs.skip == 'false'
@@ -82,11 +79,10 @@ jobs:
           set -euo pipefail
 
           BACKUP_BRANCH="backup/main-demo-before-sync-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git push origin "${DEMO_SHA}:refs/heads/${BACKUP_BRANCH}"
 
-          git push origin \
-            "${DEMO_SHA}:refs/heads/${BACKUP_BRANCH}"
-
-          echo "Created backup branch: $BACKUP_BRANCH"
+          echo "✅ Created backup branch: $BACKUP_BRANCH"
+          echo "backup_branch=$BACKUP_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Align main-demo with main
         if: steps.verify.outputs.skip == 'false'
@@ -102,5 +98,4 @@ jobs:
             origin \
             "${MAIN_SHA}:refs/heads/main-demo"
 
-          echo "main-demo now points to $MAIN_SHA"
-
+          echo "✅ main-demo successfully aligned to $MAIN_SHA"
