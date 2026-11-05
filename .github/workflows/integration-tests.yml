@@ -5,11 +5,16 @@ on:
     branches:
       - main-demo
       - main
+      - 'feature/**'
+
   pull_request:
     branches:
+      - main-demo
       - main
+
 permissions:
-  contents: read  
+  contents: read
+
 jobs:
   integration-tests:
     runs-on: self-hosted
