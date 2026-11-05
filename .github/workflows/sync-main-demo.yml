@@ -1,3 +1,4 @@
+
 name: Sync main-demo after merge
 
 on:
@@ -7,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: sync-main-demo
@@ -15,18 +16,27 @@ concurrency:
 
 jobs:
   sync:
-    name: Align main-demo with main
+    name: Merge main into main-demo
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.merged == true
     runs-on: ubuntu-latest
 
     steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: DevopsLavka
+          repositories: StremBeatsC-Bec
+
       - name: Checkout main-demo
         uses: actions/checkout@v4
         with:
           ref: main-demo
-          token: ${{ secrets.PULL_REQUEST_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0
 
       - name: Configure Git
@@ -34,68 +44,97 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Fetch and verify branches
-        id: verify
+      - name: Synchronize branches with retries
         shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 
-          git fetch origin main main-demo
+          MAX_ATTEMPTS=5
+          BACKUP_CREATED=false
 
-          MAIN_SHA=$(git rev-parse origin/main)
-          DEMO_SHA=$(git rev-parse origin/main-demo)
-          MAIN_TREE=$(git rev-parse "${MAIN_SHA}^{tree}")
-          DEMO_TREE=$(git rev-parse "${DEMO_SHA}^{tree}")
+          for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
+            echo "========================================"
+            echo "Synchronization attempt: $ATTEMPT/$MAX_ATTEMPTS"
+            echo "========================================"
 
-          echo "main SHA:      $MAIN_SHA"
-          echo "main-demo SHA: $DEMO_SHA"
-          echo "main tree:     $MAIN_TREE"
-          echo "demo tree:     $DEMO_TREE"
+            # Always fetch the latest state of both branches.
+            git fetch origin main main-demo
 
-          if [[ "$MAIN_SHA" == "$DEMO_SHA" ]]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Branches already point to the same commit. Nothing to do."
-            exit 0
-          fi
+            MAIN_SHA=$(git rev-parse origin/main)
+            DEMO_SHA=$(git rev-parse origin/main-demo)
 
-          if [[ "$MAIN_TREE" != "$DEMO_TREE" ]]; then
-            echo "::error::❌ Branch contents differ. Refusing to overwrite main-demo."
-            echo "::error::main and main-demo have diverged. Manual intervention required."
-            echo "::error::No backup or branch update was performed."
+            echo "main:      $MAIN_SHA"
+            echo "main-demo: $DEMO_SHA"
+
+            # Create a backup of the original main-demo state.
+            if [[ "$BACKUP_CREATED" == "false" ]]; then
+              BACKUP_BRANCH="backup/main-demo-before-sync-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+              git push origin \
+                "${DEMO_SHA}:refs/heads/${BACKUP_BRANCH}"
+
+              echo "Backup created: $BACKUP_BRANCH"
+              BACKUP_CREATED=true
+            fi
+
+            # Start from the latest remote main-demo.
+            git checkout -B main-demo "$DEMO_SHA"
+
+            # Merge the latest main into main-demo.
+            if ! git merge --no-edit "$MAIN_SHA"; then
+              echo "::error::Merge conflict between main and main-demo."
+              git merge --abort || true
+              exit 1
+            fi
+
+            MERGED_SHA=$(git rev-parse HEAD)
+
+            # Nothing to push if the branches are already aligned.
+            if [[ "$MERGED_SHA" == "$DEMO_SHA" ]]; then
+              echo "main is already included in main-demo."
+              exit 0
+            fi
+
+            # Use a normal push. Never force-update main-demo.
+            if git push origin HEAD:refs/heads/main-demo; then
+              echo "Push succeeded."
+
+              # Verify that main did not advance during synchronization.
+              git fetch origin main main-demo
+
+              LATEST_MAIN=$(git rev-parse origin/main)
+              LATEST_DEMO=$(git rev-parse origin/main-demo)
+
+              if git merge-base --is-ancestor "$LATEST_MAIN" "$LATEST_DEMO"; then
+                echo "main is fully included in main-demo."
+                echo "Synchronization completed successfully."
+                exit 0
+              fi
+
+              echo "main advanced during synchronization. Retrying..."
+              continue
+            fi
+
+            # If main-demo changed during the operation, fetch it
+            # and retry using its newest state.
+            git fetch origin main-demo
+
+            LATEST_DEMO=$(git rev-parse origin/main-demo)
+
+            if [[ "$LATEST_DEMO" != "$DEMO_SHA" ]]; then
+              echo "main-demo changed during synchronization."
+              echo "The new commit was preserved. Retrying..."
+              continue
+            fi
+
+            echo "::error::Push failed, but main-demo did not change."
+            echo "::error::Check GitHub App permissions and branch rulesets."
             exit 1
-          fi
+          done
 
-          echo "skip=false" >> "$GITHUB_OUTPUT"
-          echo "main_sha=$MAIN_SHA" >> "$GITHUB_OUTPUT"
-          echo "demo_sha=$DEMO_SHA" >> "$GITHUB_OUTPUT"
-          echo "ℹ️ Branches have the same content but different SHAs. Will align main-demo → main."
+          echo "::error::Synchronization did not finish after $MAX_ATTEMPTS attempts."
+          echo "::error::No force-push was performed. All remote commits remain intact."
+          exit 1
 
-      - name: Backup current main-demo
-        if: steps.verify.outputs.skip == 'false'
-        shell: bash
-        env:
-          DEMO_SHA: ${{ steps.verify.outputs.demo_sha }}
-        run: |
-          set -euo pipefail
-
-          BACKUP_BRANCH="backup/main-demo-before-sync-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          git push origin "${DEMO_SHA}:refs/heads/${BACKUP_BRANCH}"
-
-          echo "✅ Created backup branch: $BACKUP_BRANCH"
-          echo "backup_branch=$BACKUP_BRANCH" >> "$GITHUB_OUTPUT"
-
-      - name: Align main-demo with main
-        if: steps.verify.outputs.skip == 'false'
-        shell: bash
-        env:
-          MAIN_SHA: ${{ steps.verify.outputs.main_sha }}
-          DEMO_SHA: ${{ steps.verify.outputs.demo_sha }}
-        run: |
-          set -euo pipefail
-
-          git push \
-            --force-with-lease="refs/heads/main-demo:${DEMO_SHA}" \
-            origin \
-            "${MAIN_SHA}:refs/heads/main-demo"
-
-          echo "✅ main-demo successfully aligned to $MAIN_SHA"
