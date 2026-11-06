@@ -18,29 +18,59 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
 
       - name: Verify tested SHA
+        id: verify
         env:
           EXPECTED_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          BASE_REF: ${{ github.event.merge_group.base_ref }}
+          HEAD_REF: ${{ github.event.merge_group.head_ref }}
         shell: bash
         run: |
           set -euo pipefail
 
           ACTUAL_SHA=$(git rev-parse HEAD)
-          TREE_SHA=$(git rev-parse HEAD^{tree})
+          TREE_SHA=$(git rev-parse 'HEAD^{tree}')
 
           echo "Expected SHA: $EXPECTED_SHA"
           echo "Actual SHA:   $ACTUAL_SHA"
           echo "Tree SHA:     $TREE_SHA"
+          echo "Base SHA:     $BASE_SHA"
+          echo "Base ref:     $BASE_REF"
+          echo "Head ref:     $HEAD_REF"
 
           if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
             echo "::error::Checked out commit does not match the merge group SHA."
             exit 1
           fi
 
-          echo "Verified: tests will run on the exact merge group commit."
+          mkdir -p merge-group-metadata
+
+          cat > merge-group-metadata/result.txt <<EOF
+          MERGE_GROUP_SHA=$ACTUAL_SHA
+          TREE_SHA=$TREE_SHA
+          BASE_SHA=$BASE_SHA
+          BASE_REF=$BASE_REF
+          HEAD_REF=$HEAD_REF
+          RUN_ID=$GITHUB_RUN_ID
+          RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT
+          REPOSITORY=$GITHUB_REPOSITORY
+          EOF
+
+          echo "Verified merge group metadata."
 
       - name: Run integration tests
         env:
           ENV_FILE: /home/vboxuser/StremBeatsC-Bec/.env
         run: ./test.sh
+
+      - name: Save successful merge group metadata
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-group-${{ github.run_id }}-${{ github.run_attempt }}
+          path: merge-group-metadata/result.txt
+          retention-days: 30
+          if-no-files-found: error
