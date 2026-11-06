@@ -17,11 +17,11 @@ jobs:
       - name: Checkout merge group commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.merge_group.head_sha }}
+          ref: ${{ github.sha }}
 
       - name: Verify tested SHA
         env:
-          EXPECTED_SHA: ${{ github.event.merge_group.head_sha }}
+          EXPECTED_SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
