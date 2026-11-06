@@ -1,4 +1,3 @@
-
 name: Enqueue Merge Queue
 
 on:
@@ -9,6 +8,7 @@ on:
       - synchronize
       - ready_for_review
     branches:
+      - main-demo
       - main
 
   workflow_dispatch:
@@ -32,9 +32,16 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (
-        github.event.pull_request.head.ref == 'main-demo' &&
-        github.event.pull_request.base.ref == 'main'
+        (
+          startsWith(github.event.pull_request.head.ref, 'feature/') &&
+          github.event.pull_request.base.ref == 'main-demo'
+        ) ||
+        (
+          github.event.pull_request.head.ref == 'main-demo' &&
+          github.event.pull_request.base.ref == 'main'
+        )
       )
+
     runs-on: ubuntu-latest
 
     env:
@@ -84,7 +91,14 @@ jobs:
           HEAD_OID=$(jq -r '.headRefOid' <<< "$PR")
           PR_ID=$(jq -r '.id' <<< "$PR")
 
-          if [[ "$HEAD_REF" != "main-demo" || "$BASE_REF" != "main" ]]; then
+          # Проверяем разрешённые пути продвижения.
+          if [[ "$HEAD_REF" == feature/* && "$BASE_REF" == "main-demo" ]]; then
+            echo "Valid promotion path: feature -> main-demo"
+
+          elif [[ "$HEAD_REF" == "main-demo" && "$BASE_REF" == "main" ]]; then
+            echo "Valid promotion path: main-demo -> main"
+
+          else
             echo "::error::Unexpected PR branches: $HEAD_REF -> $BASE_REF"
             exit 1
           fi
@@ -140,4 +154,3 @@ jobs:
             ' \
             -F pullRequestId="$PR_ID" \
             -F expectedHeadOid="$HEAD_OID"
-
