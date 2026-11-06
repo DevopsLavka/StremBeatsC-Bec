@@ -22,6 +22,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Запрещаем прямой PR из feature/* в main
+      - name: Enforce promotion path
+        if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main'
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$HEAD_REF" != "main-demo" ]]; then
+            echo "::error::Pull requests into main must come from main-demo."
+            echo "::error::Expected: main-demo -> main"
+            echo "::error::Received: $HEAD_REF -> main"
+            exit 1
+          fi
+
       - name: Run integration tests
         env:
           ENV_FILE: /home/vboxuser/StremBeatsC-Bec/.env
