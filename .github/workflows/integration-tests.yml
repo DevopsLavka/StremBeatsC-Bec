@@ -1,11 +1,6 @@
 name: Integration Tests
 
 on:
-  push:
-    branches:
-      - main-demo
-      - main
-      - 'feature/**'
 
   pull_request:
     branches:
