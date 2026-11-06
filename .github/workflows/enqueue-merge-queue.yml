@@ -21,6 +21,8 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  checks: read
+  statuses: read
 
 concurrency:
   group: enqueue-pr-${{ github.event.pull_request.number || inputs.pr_number }}
