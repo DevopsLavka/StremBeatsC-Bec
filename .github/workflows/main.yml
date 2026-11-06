@@ -14,8 +14,31 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      - name: Checkout repository
+      - name: Checkout merge group commit
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.merge_group.head_sha }}
+
+      - name: Verify tested SHA
+        env:
+          EXPECTED_SHA: ${{ github.event.merge_group.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          TREE_SHA=$(git rev-parse HEAD^{tree})
+
+          echo "Expected SHA: $EXPECTED_SHA"
+          echo "Actual SHA:   $ACTUAL_SHA"
+          echo "Tree SHA:     $TREE_SHA"
+
+          if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Checked out commit does not match the merge group SHA."
+            exit 1
+          fi
+
+          echo "Verified: tests will run on the exact merge group commit."
 
       - name: Run integration tests
         env:
