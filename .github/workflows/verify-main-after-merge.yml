@@ -1,0 +1,205 @@
+
+name: Verify Main After Merge
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify-main:
+    name: Verify main against successful Merge Queue checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout exact pushed commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.after }}
+          fetch-depth: 0
+
+      - name: Find matching successful Merge Queue run
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH_SHA: ${{ github.event.after }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Push before: $PUSH_BEFORE"
+          echo "Push after:  $PUSH_SHA"
+
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          MAIN_TREE=$(git rev-parse 'HEAD^{tree}')
+          PARENT_COUNT=$(git rev-list --parents -n 1 HEAD | awk '{print NF-1}')
+
+          if [[ "$ACTUAL_SHA" != "$PUSH_SHA" ]]; then
+            echo "::error::Checked out commit does not match the pushed SHA."
+            exit 1
+          fi
+
+          # В нашей схеме используется только Squash Merge.
+          if [[ "$PARENT_COUNT" -ne 1 ]]; then
+            echo "::error::Expected a single-parent Squash commit; found $PARENT_COUNT parents."
+            exit 1
+          fi
+
+          echo "Verified main commit: $ACTUAL_SHA"
+          echo "Main tree:            $MAIN_TREE"
+          echo "Parent count:         $PARENT_COUNT"
+
+          WORKFLOW_NAME="Merge Queue"
+
+          mapfile -t WORKFLOW_IDS < <(
+            gh api --paginate \
+              "repos/$REPOSITORY/actions/workflows?per_page=100" \
+              --jq --arg name "$WORKFLOW_NAME" \
+              '.workflows[] | select(.name == $name) | .id'
+          )
+
+          if [[ ${#WORKFLOW_IDS[@]} -ne 1 ]]; then
+            echo "::error::Expected exactly one Merge Queue workflow at $WORKFLOW_PATH; found ${#WORKFLOW_IDS[@]}."
+            exit 1
+          fi
+
+          WORKFLOW_ID="${WORKFLOW_IDS[0]}"
+          echo "Merge Queue workflow ID: $WORKFLOW_ID"
+
+          # Ограничиваем поиск успешными запусками за последние 48 часов.
+          SINCE=$(date -u -d '48 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+
+          mapfile -t RUNS < <(
+            gh api --paginate \
+              "repos/$REPOSITORY/actions/workflows/$WORKFLOW_ID/runs?event=merge_group&status=success&per_page=100" \
+              --jq --arg since "$SINCE" \
+              '.workflow_runs[]
+               | select(.created_at >= $since)
+               | [.id, .run_attempt, .created_at]
+               | @tsv'
+          )
+
+          if [[ ${#RUNS[@]} -eq 0 ]]; then
+            echo "::error::No successful Merge Queue runs found in the last 48 hours."
+            exit 1
+          fi
+
+          echo "Found ${#RUNS[@]} successful Merge Queue runs to check."
+
+          MATCH_FOUND=false
+          MATCH_RUN_ID=""
+          MATCH_GROUP_SHA=""
+          MATCH_TREE_SHA=""
+
+          TMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          for RUN in "${RUNS[@]}"; do
+            read -r RUN_ID RUN_ATTEMPT CREATED_AT <<< "$RUN"
+
+            ARTIFACT_NAME="merge-group-${RUN_ID}-${RUN_ATTEMPT}"
+            DOWNLOAD_DIR="$TMP_DIR/$RUN_ID"
+
+            mkdir -p "$DOWNLOAD_DIR"
+
+            echo "Checking run #$RUN_ID, attempt $RUN_ATTEMPT, created $CREATED_AT"
+
+            if ! gh run download "$RUN_ID" \
+              --repo "$REPOSITORY" \
+              --name "$ARTIFACT_NAME" \
+              --dir "$DOWNLOAD_DIR" >/dev/null 2>&1; then
+              echo "Artifact not available; skipping."
+              continue
+            fi
+
+            RESULT_FILE=$(find "$DOWNLOAD_DIR" -name result.txt -type f -print -quit)
+
+            if [[ -z "$RESULT_FILE" ]]; then
+              echo "Metadata file not found; skipping."
+              continue
+            fi
+
+            ARTIFACT_TREE=$(grep -m1 '^TREE_SHA=' "$RESULT_FILE" | cut -d= -f2- || true)
+            ARTIFACT_BASE=$(grep -m1 '^BASE_SHA=' "$RESULT_FILE" | cut -d= -f2- || true)
+            ARTIFACT_BASE_REF=$(grep -m1 '^BASE_REF=' "$RESULT_FILE" | cut -d= -f2- || true)
+            ARTIFACT_GROUP_SHA=$(grep -m1 '^MERGE_GROUP_SHA=' "$RESULT_FILE" | cut -d= -f2- || true)
+
+            if [[ -z "$ARTIFACT_TREE" || -z "$ARTIFACT_BASE" || -z "$ARTIFACT_GROUP_SHA" ]]; then
+              echo "Required metadata is missing; skipping."
+              continue
+            fi
+
+            if [[ "$ARTIFACT_BASE_REF" != "main" &&
+                  "$ARTIFACT_BASE_REF" != "refs/heads/main" ]]; then
+              echo "Base ref is not main ($ARTIFACT_BASE_REF); skipping."
+              continue
+            fi
+
+            # Дерево итогового main должно точно совпасть с проверенным деревом.
+            if [[ "$ARTIFACT_TREE" != "$MAIN_TREE" ]]; then
+              echo "Tree mismatch; skipping."
+              continue
+            fi
+
+            # BASE_SHA должен находиться в истории итогового main-коммита.
+            # Это учитывает группы, содержащие несколько PR.
+            if ! git merge-base --is-ancestor "$ARTIFACT_BASE" "$ACTUAL_SHA"; then
+              echo "Merge group base is not an ancestor of main; skipping."
+              continue
+            fi
+
+            MATCH_FOUND=true
+            MATCH_RUN_ID="$RUN_ID"
+            MATCH_GROUP_SHA="$ARTIFACT_GROUP_SHA"
+            MATCH_TREE_SHA="$ARTIFACT_TREE"
+
+            echo "Matching successful Merge Queue run found."
+            break
+          done
+
+          if [[ "$MATCH_FOUND" != "true" ]]; then
+            echo "::error::No successful Merge Queue run matches the pushed main commit."
+            echo "::error::Main SHA:  $ACTUAL_SHA"
+            echo "::error::Main tree: $MAIN_TREE"
+            exit 1
+          fi
+
+          echo "========================================="
+          echo "Matching Merge Queue run: $MATCH_RUN_ID"
+          echo "Merge group SHA:          $MATCH_GROUP_SHA"
+          echo "Verified main SHA:        $ACTUAL_SHA"
+          echo "Verified tree SHA:        $MATCH_TREE_SHA"
+          echo "========================================="
+
+          {
+            echo "verified_main_sha=$ACTUAL_SHA"
+            echo "verified_tree_sha=$MATCH_TREE_SHA"
+            echo "merge_group_sha=$MATCH_GROUP_SHA"
+            echo "merge_queue_run_id=$MATCH_RUN_ID"
+          } >> "$GITHUB_OUTPUT"
+
+          mkdir -p verification-proof
+
+          cat > verification-proof/result.txt <<EOF
+          VERIFIED_MAIN_SHA=$ACTUAL_SHA
+          VERIFIED_TREE_SHA=$MATCH_TREE_SHA
+          MERGE_GROUP_SHA=$MATCH_GROUP_SHA
+          MERGE_QUEUE_RUN_ID=$MATCH_RUN_ID
+          BASE_SHA=$ARTIFACT_BASE
+          REPOSITORY=$REPOSITORY
+          EOF
+
+      - name: Save main verification proof
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-main-${{ github.run_id }}-${{ github.run_attempt }}
+          path: verification-proof/result.txt
+          retention-days: 90
+          if-no-files-found: error
