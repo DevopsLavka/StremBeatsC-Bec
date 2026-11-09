@@ -1,0 +1,386 @@
+name: Merge Group Metadata
+
+on: 
+  merge_group:
+    types: 
+    - checks_requested
+
+permissions: 
+  contents: read
+  pull-requests: read
+
+jobs:
+  collect-merge-group-metadata:
+    runs-on: ubuntu-latest
+
+    if: github.event.merge_group.base_ref == 'refs/heads/main-demo'
+
+    steps:
+    # --- ШАГ 1: Инициализация кода ---
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      # --- ШАГ 2: Сбор базового контекста окружения ---
+      - name: Gather Base Metadata
+        id: base_meta
+        run: |
+          echo "TREE_SHA=$(git rev-parse HEAD^{tree})" >> $GITHUB_ENV
+          echo "PROVENANCE_ID=provenance-${{ github.repository }}-${{ github.run_id}}" >> $GITHUB_ENV
+          echo "RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id}}" >> $GITHUB_ENV
+
+      # --- ШАГ 3: Развертка истории и поиск Pull Request ----
+      - name: Scan Merge Group for Pull Requests
+        id: scan_prs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+
+          GITHUB_REF_VALUE: ${{ github.ref }}
+          EVENT_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          BASE_REF: ${{ github.event.merge_group.base_ref }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Merge Group Event ==="
+          echo "GITHUB_REF: $GITHUB_REF_VALUE"
+          echo "head_ref:   $EVENT_HEAD_REF"
+          echo "base_ref:   $BASE_REF"
+          echo "base_sha:   $BASE_SHA"
+          echo "head_sha:   $HEAD_SHA"
+
+          # 1. Extract candidate PR number from the merge group ref.
+          REF_TO_PARSE="${EVENT_HEAD_REF:-$GITHUB_REF_VALUE}"
+
+          if [[ "$REF_TO_PARSE" =~ /pr-([0-9]+)(-[0-9a-fA-F]+)?$ ]]; then
+            PR_NUMBER="${BASH_REMATCH[1]}"
+          else
+            echo "::error::Cannot extract PR number from merge group ref: $REF_TO_PARSE"
+            exit 1
+          fi
+
+          echo "Candidate PR: #$PR_NUMBER"
+
+          # 2. Resolve repository and target branch.
+          OWNER="${GH_REPO%%/*}"
+          REPO="${GH_REPO#*/}"
+
+          if [[ "$BASE_REF" != refs/heads/* ]]; then
+            echo "::error::Unexpected base_ref: $BASE_REF"
+            exit 1
+          fi
+
+          BASE_BRANCH="${BASE_REF#refs/heads/}"
+
+          echo "Target branch: $BASE_BRANCH"
+
+          # 3. Query the queue and the candidate's direct MergeQueueEntry.
+          QUERY='
+            query(
+              $owner: String!,
+              $name: String!,
+              $branch: String!,
+              $number: Int!,
+              $after: String
+            ) {
+              repository(owner: $owner, name: $name) {
+                mergeQueue(branch: $branch) {
+                  id
+
+                  configuration {
+                    maximumEntriesToBuild
+                    maximumEntriesToMerge
+                    minimumEntriesToMerge
+                    minimumEntriesToMergeWaitTime
+                    mergeMethod
+                    mergingStrategy
+                  }
+
+                  entries(first: 100, after: $after) {
+                    totalCount
+
+                    nodes {
+                      id
+                      position
+                      state
+                      solo
+                      jump
+
+                      pullRequest {
+                        number
+                        url
+                      }
+
+                      headCommit {
+                        oid
+                      }
+
+                      baseCommit {
+                        oid
+                      }
+                    }
+
+                    pageInfo {
+                      hasNextPage
+                      endCursor
+                    }
+                  }
+                }
+
+                pullRequest(number: $number) {
+                  number
+
+                  mergeQueueEntry {
+                    id
+                    position
+                    state
+                    solo
+                    jump
+
+                    headCommit {
+                      oid
+                    }
+
+                    baseCommit {
+                      oid
+                    }
+                  }
+                }
+              }
+            }
+          '
+
+          ALL_ENTRIES='[]'
+          CURSOR=''
+          EXPECTED_TOTAL=''
+          CANDIDATE_ENTRY='null'
+          QUEUE_CONFIG='null'
+          QUEUE_ID=''
+
+          # 4. Fetch every page.
+          while true; do
+            ARGS=(
+              -f query="$QUERY"
+              -F owner="$OWNER"
+              -F name="$REPO"
+              -F branch="$BASE_BRANCH"
+              -F number="$PR_NUMBER"
+            )
+
+            if [[ -n "$CURSOR" ]]; then
+              ARGS+=(-F after="$CURSOR")
+            fi
+
+            PAGE=$(gh api graphql "${ARGS[@]}")
+
+            if ! jq -e '
+              (.errors // [] | length) == 0
+              and .data.repository.mergeQueue != null
+              and .data.repository.pullRequest != null
+            ' >/dev/null <<< "$PAGE"; then
+              echo "::error::GraphQL returned errors or queue/PR was not found"
+              jq '.' <<< "$PAGE"
+              exit 1
+            fi
+
+            if [[ "$CANDIDATE_ENTRY" == "null" ]]; then
+              CANDIDATE_ENTRY=$(jq \
+                '.data.repository.pullRequest.mergeQueueEntry' \
+                <<< "$PAGE")
+
+              QUEUE_CONFIG=$(jq \
+                '.data.repository.mergeQueue.configuration' \
+                <<< "$PAGE")
+
+              QUEUE_ID=$(jq -r \
+                '.data.repository.mergeQueue.id' \
+                <<< "$PAGE")
+
+              EXPECTED_TOTAL=$(jq \
+                '.data.repository.mergeQueue.entries.totalCount' \
+                <<< "$PAGE")
+
+              if [[ "$CANDIDATE_ENTRY" == "null" ]]; then
+                echo "::error::PR #$PR_NUMBER has no MergeQueueEntry"
+                exit 1
+              fi
+            fi
+
+            PAGE_NODES=$(jq \
+              '.data.repository.mergeQueue.entries.nodes' \
+              <<< "$PAGE")
+
+            ALL_ENTRIES=$(jq -cn \
+              --argjson old "$ALL_ENTRIES" \
+              --argjson new "$PAGE_NODES" \
+              '$old + $new')
+
+            HAS_NEXT=$(jq -r \
+              '.data.repository.mergeQueue.entries.pageInfo.hasNextPage' \
+              <<< "$PAGE")
+
+            if [[ "$HAS_NEXT" != "true" ]]; then
+              break
+            fi
+
+            CURSOR=$(jq -r \
+              '.data.repository.mergeQueue.entries.pageInfo.endCursor' \
+              <<< "$PAGE")
+
+            if [[ -z "$CURSOR" || "$CURSOR" == "null" ]]; then
+              echo "::error::Pagination cursor is missing"
+              exit 1
+            fi
+          done
+
+          # 5. Validate that pagination returned the complete connection.
+          ACTUAL_TOTAL=$(jq 'length' <<< "$ALL_ENTRIES")
+
+          if [[ "$ACTUAL_TOTAL" != "$EXPECTED_TOTAL" ]]; then
+            echo "::error::Incomplete queue: expected $EXPECTED_TOTAL entries, got $ACTUAL_TOTAL"
+            exit 1
+          fi
+
+          UNIQUE_IDS=$(jq '[.[].id] | unique | length' <<< "$ALL_ENTRIES")
+
+          if [[ "$UNIQUE_IDS" != "$ACTUAL_TOTAL" ]]; then
+            echo "::error::Duplicate MergeQueueEntry IDs in paginated result"
+            exit 1
+          fi
+
+          # 6. Verify that direct PR lookup matches the queue entry.
+          CANDIDATE_ID=$(jq -r '.id' <<< "$CANDIDATE_ENTRY")
+          CANDIDATE_POSITION=$(jq -r '.position' <<< "$CANDIDATE_ENTRY")
+
+          MATCH_COUNT=$(jq \
+            --arg id "$CANDIDATE_ID" \
+            '[.[] | select(.id == $id)] | length' \
+            <<< "$ALL_ENTRIES")
+
+          if [[ "$MATCH_COUNT" != "1" ]]; then
+            echo "::error::Candidate entry is not present exactly once in the queue"
+            exit 1
+          fi
+
+          QUEUE_CANDIDATE_NUMBER=$(jq -r \
+            --arg id "$CANDIDATE_ID" \
+            '.[] | select(.id == $id) | .pullRequest.number' \
+            <<< "$ALL_ENTRIES")
+
+          if [[ "$QUEUE_CANDIDATE_NUMBER" != "$PR_NUMBER" ]]; then
+            echo "::error::Ref candidate and GraphQL candidate do not match"
+            exit 1
+          fi
+
+          QUEUE_CANDIDATE_POSITION=$(jq -r \
+            --arg id "$CANDIDATE_ID" \
+            '.[] | select(.id == $id) | .position' \
+            <<< "$ALL_ENTRIES")
+
+          if [[ "$QUEUE_CANDIDATE_POSITION" != "$CANDIDATE_POSITION" ]]; then
+            echo "::error::Candidate position differs between GraphQL lookups"
+            exit 1
+          fi
+
+          # 7. Calculate the FIFO prefix ending at the candidate.
+          PREFIX=$(jq \
+            --argjson position "$CANDIDATE_POSITION" \
+            '[.[] | select(.position <= $position)] | sort_by(.position)' \
+            <<< "$ALL_ENTRIES")
+
+          PREFIX_COUNT=$(jq 'length' <<< "$PREFIX")
+
+          # 8. Expose solo/jump information for review.
+          SOLO_ENTRIES=$(jq \
+            '[.[] | select(.solo == true)]' \
+            <<< "$PREFIX")
+
+          JUMP_ENTRIES=$(jq \
+            '[.[] | select(.jump == true)]' \
+            <<< "$ALL_ENTRIES")
+
+          RESULT=$(jq -n \
+            --arg ref "$GITHUB_REF_VALUE" \
+            --arg head_ref "$EVENT_HEAD_REF" \
+            --arg base_ref "$BASE_REF" \
+            --arg base_sha "$BASE_SHA" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg candidate_number "$PR_NUMBER" \
+            --arg queue_id "$QUEUE_ID" \
+            --argjson configuration "$QUEUE_CONFIG" \
+            --argjson candidate "$CANDIDATE_ENTRY" \
+            --argjson all_entries "$ALL_ENTRIES" \
+            --argjson prefix "$PREFIX" \
+            --argjson solo_entries "$SOLO_ENTRIES" \
+            --argjson jump_entries "$JUMP_ENTRIES" \
+            '{
+              event: {
+                ref: $ref,
+                head_ref: $head_ref,
+                base_ref: $base_ref,
+                base_sha: $base_sha,
+                head_sha: $head_sha
+              },
+              queue_id: $queue_id,
+              configuration: $configuration,
+              candidate_number: ($candidate_number | tonumber),
+              candidate_entry: $candidate,
+              all_queue_entries: $all_entries,
+              entries_up_to_candidate: $prefix,
+              solo_entries_in_prefix: $solo_entries,
+              jump_entries: $jump_entries
+            }')
+
+          echo "=== GraphQL Queue Result ==="
+          echo "$RESULT" | jq '.'
+
+          {
+            echo "## Merge Queue Diagnostic"
+            echo
+            echo "**Candidate:** #$PR_NUMBER"
+            echo
+            echo "**Queue entries:** $ACTUAL_TOTAL"
+            echo
+            echo "**Entries up to candidate:** $PREFIX_COUNT"
+            echo
+            echo '```json'
+            echo "$RESULT" | jq '.'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 9. Git graph is only for comparison, not PR discovery.
+          echo
+          echo "=== Git graph: BASE_SHA..HEAD_SHA ==="
+
+          if git cat-file -e "$BASE_SHA^{commit}" \
+            && git cat-file -e "$HEAD_SHA^{commit}"; then
+
+            git log \
+              --graph \
+              --oneline \
+              --decorate \
+              "$BASE_SHA..$HEAD_SHA"
+
+            echo
+            echo "=== Commit details ==="
+
+            git log \
+              --format='%H %P %s' \
+              "$BASE_SHA..$HEAD_SHA"
+          else
+            echo "::warning::Could not resolve both event SHAs locally; skipping Git graph comparison"
+          fi
+
+          # Diagnostic warning only. Do not silently infer solo grouping rules.
+          if [[ "$(jq 'length' <<< "$SOLO_ENTRIES")" -gt 0 ]]; then
+            echo "::warning::A solo entry exists in the FIFO prefix. Review its grouping semantics before using this result in production."
+          fi
+
+          echo
+          echo "=== Diagnostic completed ==="
+          
+          
