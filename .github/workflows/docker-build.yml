@@ -1,0 +1,179 @@
+name: Docker Build
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: "Git commit SHA to build"
+        required: true
+        type: string
+
+      image_tag:
+        description: "Docker image tag"
+        required: true
+        type: string
+
+      require_verified_source:
+        description: "Require source verification"
+        required: false
+        type: boolean
+        default: false
+
+      verified_source_sha:
+        description: "Git commit SHA approved by Verify workflow"
+        required: false
+        type: string
+        default: ""
+
+    outputs:
+      webapi_image:
+        description: "WebAPI image reference by digest"
+        value: ${{ jobs.build.outputs.webapi_image }}
+
+      music_business_service_image:
+        description: "Music Business Service image reference by digest"
+        value: ${{ jobs.build.outputs.music_business_service_image }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+
+    outputs:
+      webapi_image: ${{ steps.webapi-meta.outputs.image }}
+      music_business_service_image: ${{ steps.music-business-meta.outputs.image }}
+
+    steps:
+      - name: Validate build source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_ref }}
+          REQUIRE_VERIFIED_SOURCE: ${{ inputs.require_verified_source }}
+          VERIFIED_SOURCE_SHA: ${{ inputs.verified_source_sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$SOURCE_SHA" ]]; then
+            echo "::error::source_ref must not be empty."
+            exit 1
+          fi
+
+          if [[ "$REQUIRE_VERIFIED_SOURCE" == "true" ]]; then
+            if [[ -z "$VERIFIED_SOURCE_SHA" ]]; then
+              echo "::error::verified_source_sha is required."
+              exit 1
+            fi
+
+            if [[ "$SOURCE_SHA" != "$VERIFIED_SOURCE_SHA" ]]; then
+              echo "::error::Build source does not match verified source SHA."
+              exit 1
+            fi
+
+            echo "Verified source SHA matches build source."
+          else
+            echo "Building without Verify requirement."
+          fi
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+
+      - name: Verify checked out source SHA
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+
+          ACTUAL_SHA=$(git rev-parse HEAD)
+
+          echo "Expected SHA: $EXPECTED_SHA"
+          echo "Actual SHA:   $ACTUAL_SHA"
+
+          if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Checked out commit does not match requested source_ref."
+            exit 1
+          fi
+
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "::error::Working directory contains unexpected changes."
+            git status --short
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Define image names
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+
+          echo "webapi=ghcr.io/${OWNER}/webapi" >> "$GITHUB_OUTPUT"
+          echo "music_business_service=ghcr.io/${OWNER}/music-business-service" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push WebAPI
+        id: webapi-build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: WebAPI/Docker/Dockerfile
+          push: true
+          tags: ${{ steps.metadata.outputs.webapi }}:${{ inputs.image_tag }}
+          cache-from: type=gha,scope=webapi
+          cache-to: type=gha,mode=max,scope=webapi
+
+      - name: Create WebAPI image reference
+        id: webapi-meta
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.metadata.outputs.webapi }}
+          IMAGE_DIGEST: ${{ steps.webapi-build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          IMAGE_REF="${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+          echo "image=$IMAGE_REF" >> "$GITHUB_OUTPUT"
+          echo "Published image: $IMAGE_REF"
+
+      - name: Build and push Music Business Service
+        id: music-business-build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: MusicBusinessService/Docker/Dockerfile
+          push: true
+          tags: ${{ steps.metadata.outputs.music_business_service }}:${{ inputs.image_tag }}
+          cache-from: type=gha,scope=music-business-service
+          cache-to: type=gha,mode=max,scope=music-business-service
+
+      - name: Create Music Business Service image reference
+        id: music-business-meta
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.metadata.outputs.music_business_service }}
+          IMAGE_DIGEST: ${{ steps.music-business-build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          IMAGE_REF="${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+          echo "image=$IMAGE_REF" >> "$GITHUB_OUTPUT"
+          echo "Published image: $IMAGE_REF"
