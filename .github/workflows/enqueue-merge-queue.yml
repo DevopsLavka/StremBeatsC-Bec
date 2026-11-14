@@ -21,8 +21,6 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  checks: read
-  statuses: read
 
 concurrency:
   group: enqueue-pr-${{ github.event.pull_request.number || inputs.pr_number }}
@@ -67,6 +65,7 @@ jobs:
                 repository(owner: $owner, name: $name) {
                   pullRequest(number: $number) {
                     id
+                    url
                     headRefOid
                     headRefName
                     baseRefName
@@ -84,16 +83,14 @@ jobs:
             exit 1
           fi
 
-          echo "$PR" | jq .
-
           HEAD_REF=$(jq -r '.headRefName' <<< "$PR")
           BASE_REF=$(jq -r '.baseRefName' <<< "$PR")
           IS_DRAFT=$(jq -r '.isDraft' <<< "$PR")
           IS_QUEUED=$(jq -r '.isInMergeQueue' <<< "$PR")
           HEAD_OID=$(jq -r '.headRefOid' <<< "$PR")
           PR_ID=$(jq -r '.id' <<< "$PR")
+          PR_URL=$(jq -r '.url' <<< "$PR")
 
-          # Проверяем разрешённые пути продвижения.
           if [[ "$HEAD_REF" == feature/* && "$BASE_REF" == "main-demo" ]]; then
             echo "Valid promotion path: feature -> main-demo"
 
@@ -120,19 +117,16 @@ jobs:
             exit 0
           fi
 
-          echo "pr_id=$PR_ID" >> "$GITHUB_OUTPUT"
-          echo "head_oid=$HEAD_OID" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for required PR checks
-        if: steps.validate.outputs.pr_id != ''
-        run: |
-          gh pr checks "$PR_NUMBER" \
-            --repo "$GITHUB_REPOSITORY" \
-            --required \
-            --watch \
-            --fail-fast
+          {
+            echo "pr_id=$PR_ID"
+            echo "head_oid=$HEAD_OID"
+            echo "head_ref=$HEAD_REF"
+            echo "base_ref=$BASE_REF"
+            echo "pr_url=$PR_URL"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Enqueue pull request
+        id: enqueue
         if: steps.validate.outputs.pr_id != ''
         shell: bash
         env:
@@ -141,7 +135,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          gh api graphql \
+          ENQUEUE_JSON=$(gh api graphql \
             -f query='
               mutation($pullRequestId: ID!, $expectedHeadOid: GitObjectID!) {
                 enqueuePullRequest(input: {
@@ -155,4 +149,95 @@ jobs:
               }
             ' \
             -F pullRequestId="$PR_ID" \
-            -F expectedHeadOid="$HEAD_OID"
+            -F expectedHeadOid="$HEAD_OID")
+
+          QUEUE_ENTRY_ID=$(jq -r \
+            '.data.enqueuePullRequest.mergeQueueEntry.id // empty' \
+            <<< "$ENQUEUE_JSON")
+
+          if [[ -z "$QUEUE_ENTRY_ID" ]]; then
+            echo "::error::GitHub did not return a Merge Queue Entry ID."
+            jq . <<< "$ENQUEUE_JSON"
+            exit 1
+          fi
+
+          echo "queue_entry_id=$QUEUE_ENTRY_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Create enqueue event record
+        if: steps.enqueue.outputs.queue_entry_id != ''
+        shell: bash
+        env:
+          PR_ID: ${{ steps.validate.outputs.pr_id }}
+          PR_URL: ${{ steps.validate.outputs.pr_url }}
+          HEAD_OID: ${{ steps.validate.outputs.head_oid }}
+          HEAD_REF: ${{ steps.validate.outputs.head_ref }}
+          BASE_REF: ${{ steps.validate.outputs.base_ref }}
+          QUEUE_ENTRY_ID: ${{ steps.enqueue.outputs.queue_entry_id }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p workflow-data
+
+          CREATED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          jq -n \
+            --arg record_id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg pr_number "$PR_NUMBER" \
+            --arg pr_id "$PR_ID" \
+            --arg pr_url "$PR_URL" \
+            --arg head_ref "$HEAD_REF" \
+            --arg base_ref "$BASE_REF" \
+            --arg head_sha "$HEAD_OID" \
+            --arg queue_entry_id "$QUEUE_ENTRY_ID" \
+            --arg created_at "$CREATED_AT" \
+            --arg event_name "$GITHUB_EVENT_NAME" \
+            --arg event_action "${{ github.event.action || 'workflow_dispatch' }}" \
+            --arg actor "$GITHUB_ACTOR" \
+            --arg workflow_name "$GITHUB_WORKFLOW" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --arg workflow_sha "$GITHUB_WORKFLOW_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '{
+              record_id: $record_id,
+              record_type: "pull_request_enqueue",
+              created_at: $created_at,
+              repository: $repository,
+              pull_request: {
+                number: ($pr_number | tonumber),
+                id: $pr_id,
+                url: $pr_url,
+                head_ref: $head_ref,
+                base_ref: $base_ref,
+                head_sha: $head_sha
+              },
+              merge_queue: {
+                entry_id: $queue_entry_id,
+                status: "enqueued"
+              },
+              workflow_run: {
+                run_id: ($run_id | tonumber),
+                run_attempt: ($run_attempt | tonumber),
+                workflow_name: $workflow_name,
+                workflow_ref: $workflow_ref,
+                workflow_sha: $workflow_sha,
+                event_name: $event_name,
+                event_action: $event_action,
+                actor: $actor,
+                run_url: $run_url
+              }
+            }' > workflow-data/enqueue-event.json
+
+          jq . workflow-data/enqueue-event.json
+
+      - name: Upload enqueue event artifact
+        if: steps.enqueue.outputs.queue_entry_id != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: enqueue-pr-${{ env.PR_NUMBER }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: workflow-data/enqueue-event.json
+          if-no-files-found: error
+          retention-days: 7
+
