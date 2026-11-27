@@ -1,3 +1,4 @@
+
 name: Integration Tests
 
 on:
@@ -17,12 +18,21 @@ permissions:
 jobs:
   integration-tests:
     runs-on: self-hosted
+
     steps:
+      - name: Capture workflow start time
+        id: started
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "started_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # Запрещаем прямой PR из feature/* в main
       - name: Enforce promotion path
+        id: promotion
         if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main'
         env:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -38,6 +48,138 @@ jobs:
           fi
 
       - name: Run integration tests
+        id: tests
         env:
           ENV_FILE: /home/vboxuser/StremBeatsC-Bec/.env
-        run: ./test.sh
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          TEST_STARTED_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          echo "started_at=$TEST_STARTED_AT" >> "$GITHUB_OUTPUT"
+
+          ./test.sh
+          TEST_EXIT_CODE=$?
+
+          TEST_COMPLETED_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+          echo "completed_at=$TEST_COMPLETED_AT" >> "$GITHUB_OUTPUT"
+          echo "exit_code=$TEST_EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          exit "$TEST_EXIT_CODE"
+
+      # Создаём evidence даже при ошибке тестов или предыдущих шагов.
+      - name: Create integration tests evidence
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          JOB_STATUS: ${{ job.status }}
+          WORKFLOW_STARTED_AT: ${{ steps.started.outputs.started_at }}
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+          TEST_STARTED_AT: ${{ steps.tests.outputs.started_at }}
+          TEST_COMPLETED_AT: ${{ steps.tests.outputs.completed_at }}
+          TEST_EXIT_CODE: ${{ steps.tests.outputs.exit_code }}
+          PROMOTION_OUTCOME: ${{ steps.promotion.outcome }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            const passed = process.env.JOB_STATUS === 'success';
+
+            const pullRequest = context.payload.pull_request || null;
+
+            const evidence = {
+              record_type: 'integration_tests_evidence',
+              created_at: new Date().toISOString(),
+              repository: context.repo.owner + '/' + context.repo.repo,
+
+              workflow_run: {
+                run_id: context.runId,
+                run_attempt: context.runAttempt,
+                workflow_name: context.workflow,
+                workflow_ref: process.env.WORKFLOW_REF,
+                workflow_sha: process.env.WORKFLOW_SHA,
+                event_name: context.eventName,
+                actor: context.actor,
+                run_url:
+                  `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
+                  `/actions/runs/${context.runId}`
+              },
+
+              source: {
+                tested_commit_sha: context.sha,
+                ref: context.ref,
+                pull_request: pullRequest ? {
+                  number: pullRequest.number,
+                  id: pullRequest.id,
+                  url: pullRequest.html_url,
+                  base_ref: pullRequest.base.ref,
+                  head_ref: pullRequest.head.ref,
+                  head_sha: pullRequest.head.sha
+                } : null
+              },
+
+              validation_evidence: {
+                workflow_runs: [
+                  {
+                    run_id: context.runId,
+                    run_attempt: context.runAttempt,
+                    workflow_name: context.workflow,
+                    workflow_ref: process.env.WORKFLOW_REF,
+                    workflow_sha: process.env.WORKFLOW_SHA,
+                    event_name: context.eventName,
+                    actor: context.actor,
+                    run_url:
+                      `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
+                      `/actions/runs/${context.runId}`
+                  }
+                ],
+
+                // Финальные Check Run IDs и conclusion
+                // будут получены агрегатором после завершения workflow.
+                check_results: [],
+
+                overall_validation: {
+                  status: passed ? 'passed' : 'failed',
+                  required_checks: ['integration-tests'],
+                  all_required_passed: passed
+                }
+              },
+
+              integration_tests: {
+                job_name: 'integration-tests',
+                job_status: process.env.JOB_STATUS,
+                workflow_started_at: process.env.WORKFLOW_STARTED_AT || null,
+                promotion_check_outcome:
+                  process.env.PROMOTION_OUTCOME || 'not_required',
+                test_outcome: process.env.TEST_OUTCOME || 'not_started',
+                test_started_at: process.env.TEST_STARTED_AT || null,
+                test_completed_at: process.env.TEST_COMPLETED_AT || null,
+                test_exit_code:
+                  process.env.TEST_EXIT_CODE === ''
+                    ? null
+                    : process.env.TEST_EXIT_CODE === undefined
+                      ? null
+                      : Number(process.env.TEST_EXIT_CODE)
+              },
+
+              check_run_resolution: 'resolve_after_workflow_completion'
+            };
+
+            fs.mkdirSync('workflow-data', { recursive: true });
+
+            fs.writeFileSync(
+              'workflow-data/integration-tests-evidence.json',
+              JSON.stringify(evidence, null, 2) + '\n'
+            );
+
+      - name: Upload integration tests evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-tests-${{ github.run_id }}-${{ github.run_attempt }}
+          path: workflow-data/integration-tests-evidence.json
+          retention-days: 7
+          if-no-files-found: error
