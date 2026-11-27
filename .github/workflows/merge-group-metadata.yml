@@ -1,40 +1,73 @@
 name: Merge Group Metadata
 
-on: 
+on:
   merge_group:
-    types: 
-    - checks_requested
-
-permissions: 
-  contents: read
-  pull-requests: read
+    types:
+      - checks_requested
 
 jobs:
   collect-merge-group-metadata:
+    name: Collect Merge Group Metadata
     runs-on: ubuntu-latest
 
-    if: github.event.merge_group.base_ref == 'refs/heads/main-demo'
+    if: >-
+      github.event.merge_group.base_ref == 'refs/heads/main-demo' ||
+      github.event.merge_group.base_ref == 'refs/heads/main'
 
     steps:
-    # --- ШАГ 1: Инициализация кода ---
+      # --- 1. Checkout exact merge group commit ---
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.merge_group.head_sha }}
           fetch-depth: 0
-          
-      # --- ШАГ 2: Сбор базового контекста окружения ---
+          token: ${{ secrets.CI_CD_BOT_TOKEN }}
+
+      # --- 2. Gather workflow and merge group metadata ---
       - name: Gather Base Metadata
         id: base_meta
-        run: |
-          echo "TREE_SHA=$(git rev-parse HEAD^{tree})" >> $GITHUB_ENV
-          echo "PROVENANCE_ID=provenance-${{ github.repository }}-${{ github.run_id}}" >> $GITHUB_ENV
-          echo "RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id}}" >> $GITHUB_ENV
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.merge_group.head_sha }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          BASE_REF: ${{ github.event.merge_group.base_ref }}
+          HEAD_REF: ${{ github.event.merge_group.head_ref }}
 
-      # --- ШАГ 3: Развертка истории и поиск Pull Request ----
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          TREE_SHA=$(git rev-parse 'HEAD^{tree}')
+
+          if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Checked out commit does not match merge group head SHA."
+            exit 1
+          fi
+
+          PROVENANCE_ID="merge-group:${REPOSITORY}:${BASE_SHA}:${ACTUAL_SHA}"
+          RUN_URL="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
+
+          echo "ACTUAL_SHA=$ACTUAL_SHA" >> "$GITHUB_ENV"
+          echo "TREE_SHA=$TREE_SHA" >> "$GITHUB_ENV"
+          echo "PROVENANCE_ID=$PROVENANCE_ID" >> "$GITHUB_ENV"
+          echo "RUN_URL=$RUN_URL" >> "$GITHUB_ENV"
+
+          echo "Verified merge group checkout."
+          echo "Commit SHA: $ACTUAL_SHA"
+          echo "Tree SHA: $TREE_SHA"
+
+      # --- 3. Scan Merge Queue and identify PR metadata ---
       - name: Scan Merge Group for Pull Requests
         id: scan_prs
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.CI_CD_BOT_TOKEN }}
           GH_REPO: ${{ github.repository }}
 
           GITHUB_REF_VALUE: ${{ github.ref }}
@@ -42,6 +75,23 @@ jobs:
           BASE_REF: ${{ github.event.merge_group.base_ref }}
           BASE_SHA: ${{ github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          ACTOR: ${{ github.actor }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SERVER_URL: ${{ github.server_url }}
+
+          ACTUAL_SHA: ${{ env.ACTUAL_SHA }}
+          TREE_SHA: ${{ env.TREE_SHA }}
+          PROVENANCE_ID: ${{ env.PROVENANCE_ID }}
+          RUN_URL: ${{ env.RUN_URL }}
+
         shell: bash
         run: |
           set -euo pipefail
@@ -53,7 +103,7 @@ jobs:
           echo "base_sha:   $BASE_SHA"
           echo "head_sha:   $HEAD_SHA"
 
-          # 1. Extract candidate PR number from the merge group ref.
+          # 1. Extract candidate PR number from merge group ref.
           REF_TO_PARSE="${EVENT_HEAD_REF:-$GITHUB_REF_VALUE}"
 
           if [[ "$REF_TO_PARSE" =~ /pr-([0-9]+)(-[0-9a-fA-F]+)?$ ]]; then
@@ -78,7 +128,7 @@ jobs:
 
           echo "Target branch: $BASE_BRANCH"
 
-          # 3. Query the queue and the candidate's direct MergeQueueEntry.
+          # 3. Query queue, configuration, entries and candidate PR.
           QUERY='
             query(
               $owner: String!,
@@ -112,7 +162,11 @@ jobs:
 
                       pullRequest {
                         number
+                        id
                         url
+                        baseRefName
+                        headRefName
+                        headRefOid
                       }
 
                       headCommit {
@@ -133,6 +187,11 @@ jobs:
 
                 pullRequest(number: $number) {
                   number
+                  id
+                  url
+                  baseRefName
+                  headRefName
+                  headRefOid
 
                   mergeQueueEntry {
                     id
@@ -158,6 +217,7 @@ jobs:
           CURSOR=''
           EXPECTED_TOTAL=''
           CANDIDATE_ENTRY='null'
+          CANDIDATE_PR='null'
           QUEUE_CONFIG='null'
           QUEUE_ID=''
 
@@ -190,6 +250,10 @@ jobs:
             if [[ "$CANDIDATE_ENTRY" == "null" ]]; then
               CANDIDATE_ENTRY=$(jq \
                 '.data.repository.pullRequest.mergeQueueEntry' \
+                <<< "$PAGE")
+
+              CANDIDATE_PR=$(jq \
+                '.data.repository.pullRequest' \
                 <<< "$PAGE")
 
               QUEUE_CONFIG=$(jq \
@@ -237,7 +301,7 @@ jobs:
             fi
           done
 
-          # 5. Validate that pagination returned the complete connection.
+          # 5. Validate complete queue pagination.
           ACTUAL_TOTAL=$(jq 'length' <<< "$ALL_ENTRIES")
 
           if [[ "$ACTUAL_TOTAL" != "$EXPECTED_TOTAL" ]]; then
@@ -252,7 +316,7 @@ jobs:
             exit 1
           fi
 
-          # 6. Verify that direct PR lookup matches the queue entry.
+          # 6. Verify direct PR lookup against queue entry.
           CANDIDATE_ID=$(jq -r '.id' <<< "$CANDIDATE_ENTRY")
           CANDIDATE_POSITION=$(jq -r '.position' <<< "$CANDIDATE_ENTRY")
 
@@ -286,7 +350,7 @@ jobs:
             exit 1
           fi
 
-          # 7. Calculate the FIFO prefix ending at the candidate.
+          # 7. Calculate FIFO prefix ending at candidate.
           PREFIX=$(jq \
             --argjson position "$CANDIDATE_POSITION" \
             '[.[] | select(.position <= $position)] | sort_by(.position)' \
@@ -294,7 +358,7 @@ jobs:
 
           PREFIX_COUNT=$(jq 'length' <<< "$PREFIX")
 
-          # 8. Expose solo/jump information for review.
+          # 8. Extract solo and jump entries.
           SOLO_ENTRIES=$(jq \
             '[.[] | select(.solo == true)]' \
             <<< "$PREFIX")
@@ -303,37 +367,102 @@ jobs:
             '[.[] | select(.jump == true)]' \
             <<< "$ALL_ENTRIES")
 
+          # 9. Build queue-prefix PR metadata.
+          # This is queue context, not proof of actual merge group membership.
+          PREFIX_PULL_REQUESTS=$(jq \
+            '[.[] | .pullRequest | select(. != null)]' \
+            <<< "$PREFIX")
+
+          CREATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          # 10. Build structured evidence.
           RESULT=$(jq -n \
-            --arg ref "$GITHUB_REF_VALUE" \
-            --arg head_ref "$EVENT_HEAD_REF" \
-            --arg base_ref "$BASE_REF" \
+            --arg created_at "$CREATED_AT" \
+            --arg repository "$REPOSITORY" \
+            --arg actual_sha "$ACTUAL_SHA" \
+            --arg tree_sha "$TREE_SHA" \
             --arg base_sha "$BASE_SHA" \
+            --arg base_ref "$BASE_REF" \
+            --arg head_ref "$EVENT_HEAD_REF" \
             --arg head_sha "$HEAD_SHA" \
-            --arg candidate_number "$PR_NUMBER" \
+            --arg provenance_id "$PROVENANCE_ID" \
+            --arg provenance_type "merge_group" \
+            --arg run_id "$RUN_ID" \
+            --arg run_attempt "$RUN_ATTEMPT" \
+            --arg workflow_name "$WORKFLOW_NAME" \
+            --arg workflow_ref "$WORKFLOW_REF" \
+            --arg workflow_sha "$WORKFLOW_SHA" \
+            --arg event_name "$EVENT_NAME" \
+            --arg actor "$ACTOR" \
+            --arg run_url "$RUN_URL" \
+            --arg ref "$GITHUB_REF_VALUE" \
             --arg queue_id "$QUEUE_ID" \
+            --arg candidate_number "$PR_NUMBER" \
             --argjson configuration "$QUEUE_CONFIG" \
             --argjson candidate "$CANDIDATE_ENTRY" \
+            --argjson candidate_pr "$CANDIDATE_PR" \
             --argjson all_entries "$ALL_ENTRIES" \
             --argjson prefix "$PREFIX" \
+            --argjson prefix_prs "$PREFIX_PULL_REQUESTS" \
             --argjson solo_entries "$SOLO_ENTRIES" \
             --argjson jump_entries "$JUMP_ENTRIES" \
             '{
-              event: {
-                ref: $ref,
-                head_ref: $head_ref,
-                base_ref: $base_ref,
-                base_sha: $base_sha,
-                head_sha: $head_sha
+              record_type: "merge_group_metadata_evidence",
+              created_at: $created_at,
+              repository: $repository,
+
+              source_provenance: {
+                merge_group: {
+                  tested_commit_sha: $actual_sha,
+                  tested_tree_sha: $tree_sha,
+                  base_commit_sha: $base_sha,
+                  base_ref: $base_ref,
+                  merge_group_ref: $head_ref,
+                  provenance_id: $provenance_id,
+                  provenance_type: $provenance_type
+                },
+
+                candidate_pull_request: $candidate_pr,
+
+                queue_prefix_pull_requests: $prefix_prs
               },
-              queue_id: $queue_id,
-              configuration: $configuration,
-              candidate_number: ($candidate_number | tonumber),
-              candidate_entry: $candidate,
-              all_queue_entries: $all_entries,
-              entries_up_to_candidate: $prefix,
-              solo_entries_in_prefix: $solo_entries,
-              jump_entries: $jump_entries
+
+              workflow_runs: [
+                {
+                  run_id: ($run_id | tonumber),
+                  run_attempt: ($run_attempt | tonumber),
+                  workflow_name: $workflow_name,
+                  workflow_ref: $workflow_ref,
+                  workflow_sha: $workflow_sha,
+                  event_name: $event_name,
+                  actor: $actor,
+                  run_url: $run_url
+                }
+              ],
+
+              merge_queue_metadata: {
+                event: {
+                  ref: $ref,
+                  head_ref: $head_ref,
+                  base_ref: $base_ref,
+                  base_sha: $base_sha,
+                  head_sha: $head_sha
+                },
+
+                queue_id: $queue_id,
+                configuration: $configuration,
+                candidate_number: ($candidate_number | tonumber),
+                candidate_entry: $candidate,
+                all_queue_entries: $all_entries,
+                entries_up_to_candidate: $prefix,
+                solo_entries_in_prefix: $solo_entries,
+                jump_entries: $jump_entries
+              }
             }')
+
+          mkdir -p workflow-data
+
+          echo "$RESULT" | jq '.' > workflow-data/merge-group-metadata-evidence.json
 
           echo "=== GraphQL Queue Result ==="
           echo "$RESULT" | jq '.'
@@ -352,7 +481,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-          # 9. Git graph is only for comparison, not PR discovery.
+          # 11. Git graph is diagnostic only.
           echo
           echo "=== Git graph: BASE_SHA..HEAD_SHA ==="
 
@@ -375,12 +504,19 @@ jobs:
             echo "::warning::Could not resolve both event SHAs locally; skipping Git graph comparison"
           fi
 
-          # Diagnostic warning only. Do not silently infer solo grouping rules.
           if [[ "$(jq 'length' <<< "$SOLO_ENTRIES")" -gt 0 ]]; then
-            echo "::warning::A solo entry exists in the FIFO prefix. Review its grouping semantics before using this result in production."
+            echo "::warning::A solo entry exists in the FIFO prefix. Review its grouping semantics before using this result."
           fi
 
           echo
-          echo "=== Diagnostic completed ==="
-          
-          
+          echo "=== Metadata collection completed ==="
+
+      # --- 4. Upload structured evidence ---
+      - name: Upload Merge Group Metadata Evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-group-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          path: workflow-data/merge-group-metadata-evidence.json
+          retention-days: 7
+          if-no-files-found: error
