@@ -1,4 +1,3 @@
-
 name: Collect Integration Tests Evidence
 
 on:
@@ -49,6 +48,22 @@ jobs:
 
             const baseRef = branch;
 
+            // Получаем полную информацию об исходном Workflow Run.
+            const { data: runDetails } =
+              await github.rest.actions.getWorkflowRun({
+                owner,
+                repo,
+                run_id: runId
+              });
+
+            // GitHub API path имеет формат:
+            // .github/workflows/integration-tests.yml@main
+            // Преобразуем его в формат github.workflow_ref.
+            const workflowPath = runDetails.path.split('@')[0];
+
+            const workflowRef =
+              `${owner}/${repo}/${workflowPath}@refs/heads/${branch}`;
+
             // Получаем jobs конкретной попытки.
             const jobs = await github.paginate(
               github.rest.actions.listJobsForWorkflowRunAttempt,
@@ -89,6 +104,7 @@ jobs:
 
             const checkRunId = Number(match[1]);
 
+            // Получаем полные Check Run metadata.
             const { data: checkRun } = await github.rest.checks.get({
               owner,
               repo,
@@ -97,34 +113,41 @@ jobs:
 
             // Проверяем соответствие SHA и результат проверки.
             if (checkRun.head_sha !== expectedSha) {
-              throw new Error('Check Run SHA does not match workflow SHA');
+              throw new Error(
+                'Check Run SHA does not match workflow SHA'
+              );
             }
 
             if (checkRun.name !== 'integration-tests') {
-              throw new Error(`Unexpected Check Run name: ${checkRun.name}`);
+              throw new Error(
+                `Unexpected Check Run name: ${checkRun.name}`
+              );
             }
 
             if (
               checkRun.status !== 'completed' ||
               checkRun.conclusion !== 'success'
             ) {
-              throw new Error('Integration Tests Check Run did not succeed');
+              throw new Error(
+                'Integration Tests Check Run did not succeed'
+              );
             }
 
-            // Поля строго соответствуют Manifest.
+            // Workflow Run — поля соответствуют Manifest.
             const workflowRunEvidence = {
               run_id: runId,
               run_attempt: runAttempt,
               workflow_name: workflowRun.name,
               validation_stage: validationStage,
               base_ref: baseRef,
-              workflow_ref: workflowRun.path,
+              workflow_ref: workflowRef,
               workflow_sha: workflowRun.head_sha,
               event_name: workflowRun.event,
               actor: workflowRun.actor.login,
               run_url: workflowRun.html_url
             };
 
+            // Check Run — поля соответствуют Manifest.
             const checkResult = {
               name: 'Integration Tests',
               validation_stage: validationStage,
@@ -140,6 +163,7 @@ jobs:
               url: checkRun.html_url
             };
 
+            // Формируем Evidence JSON.
             const evidence = {
               validation_evidence: {
                 workflow_runs: [
@@ -151,6 +175,7 @@ jobs:
               }
             };
 
+            // Сохраняем JSON.
             fs.mkdirSync('workflow-data', { recursive: true });
 
             fs.writeFileSync(
@@ -158,10 +183,15 @@ jobs:
               JSON.stringify(evidence, null, 2) + '\n'
             );
 
+            // Выводим результат в GitHub Actions Summary.
             await core.summary
               .addHeading('Integration Tests Evidence')
               .addCodeBlock(JSON.stringify(evidence, null, 2), 'json')
               .write();
+
+            core.info(
+              'Integration Tests evidence created successfully.'
+            );
 
       - name: Upload Integration Tests Evidence
         if: success()
